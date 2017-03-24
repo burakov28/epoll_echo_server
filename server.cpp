@@ -7,6 +7,8 @@
 #include <iostream>
 #include <unistd.h>
 #include <fcntl.h>
+#include <thread>
+#include <chrono>
 
 
 
@@ -22,7 +24,11 @@ const int BUFFER_SIZE = 10;
 
 int main() {
 	int listener = socket(AF_INET, SOCK_STREAM, 0);
-	fcntl(listener, F_SETFL, fcntl(listener, F_GETFD, 0)|O_NONBLOCK);
+	if (fcntl(listener, F_SETFL, fcntl(listener, F_GETFD, 0) | O_NONBLOCK) < 0) {
+		cerr << "Error while nonblocking socket" << endl;
+		close(listener);
+		return 0;
+	}
 
 	sockaddr_in my_addr;
 	memset(&my_addr, 0, sizeof(my_addr));
@@ -30,8 +36,17 @@ int main() {
 	my_addr.sin_port = htons(8082);
 	my_addr.sin_addr.s_addr = INADDR_ANY;
 
-	bind(listener, (sockaddr *) &my_addr, sizeof(my_addr));
-	listen(listener, 128);
+	if (bind(listener, (sockaddr *) &my_addr, sizeof(my_addr)) < 0) {
+		cout << "Bind error" << endl;
+		close(listener);
+		return 0;
+	}
+
+	if (listen(listener, 128) < 0) {
+		cout << "Set listener error" << endl;
+		close(listener);
+		return 0;
+	}
 
 	epoll_event ev, events[EPOLL_SIZE];
 
@@ -41,8 +56,17 @@ int main() {
 	int epollfd;
 
 	epollfd = epoll_create(EPOLL_SIZE);
+	if (epollfd < 0) {
+		cout << "Creating epoll error" << endl;
+		close(listener);
+		return 0;
+	}
 
-	epoll_ctl(epollfd, EPOLL_CTL_ADD, listener, &ev);
+	if (epoll_ctl(epollfd, EPOLL_CTL_ADD, listener, &ev) < 0) {
+		cout << "Adding socket to epoll error" << endl;
+		close(listener);
+		return 0;
+	}
 
 	sockaddr_in client_addr;
 	socklen_t client_addr_len;
@@ -51,6 +75,10 @@ int main() {
 	set < int > clients;
 	for (; ; ) {
 		int events_number = epoll_wait(epollfd, events, EPOLL_SIZE, -1);
+		if (events_number < 0) {
+			this_thread::sleep_for(chrono::milliseconds(100));
+			continue;
+		}
 
 		for (int i = 0; i < events_number; ++i) {
 			if (events[i].data.fd == listener) {
@@ -59,7 +87,14 @@ int main() {
 				fcntl(client, F_SETFL, fcntl(client, F_GETFD, 0)| O_NONBLOCK);
 				ev.data.fd = client;
 				ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-				epoll_ctl(epollfd, EPOLL_CTL_ADD, client, &ev);
+				if (epoll_ctl(epollfd, EPOLL_CTL_ADD, client, &ev) < 0) {
+					cerr << "Error adding client. It was skipped" << endl;
+					close(client);
+					continue;	
+				}
+
+				
+
 				clients.insert(client);
 				write(client, connnection_established.c_str(), connnection_established.size());
 			}
@@ -81,6 +116,7 @@ int main() {
 			}
 		}
 	}
+	close(listener);
 
 	return 0;
 }
