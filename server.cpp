@@ -1,122 +1,151 @@
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/epoll.h>
-#include <string.h>
-#include <set>
-#include <netinet/in.h>
+#include "socket_wrapper.h"
+#include "epoll_wrapper.h"
+#include "timer_container.h"
+#include "utils.h"
+#include "logger.h"
 #include <iostream>
-#include <unistd.h>
-#include <fcntl.h>
-#include <thread>
-#include <chrono>
-
-
+#include <set>
+#include <ctime>
+#include <cassert>
 
 using namespace std;
 
+const unsigned long long CLIENT_TIMEOUT = 10; //seconds
+const char *log_file = "server_log";
 
-string connnection_established = "Connection established!\n";
+timer_container<socket_wrapper> timer;
+map<socket_wrapper, timer_container<socket_wrapper>::iterator> in_timer;
+set<socket_wrapper> clients;
 
+void update_client(socket_wrapper const & client) {
+	in_timer[client] = timer.modify(in_timer[client]);
+}
 
-const int EPOLL_SIZE = 20;
-const int BUFFER_SIZE = 10;
+void disconnect_client(socket_wrapper const & client) {
+	clients.erase(client);
+	timer.remove(in_timer[client]);
+	in_timer.erase(client);
+}
 
+logger l;
+
+void init_log() {
+	l = logger(log_file);
+}
+
+void log(string message) {
+	l.log(message);
+}
 
 int main() {
-	int listener = socket(AF_INET, SOCK_STREAM, 0);
-	if (fcntl(listener, F_SETFL, fcntl(listener, F_GETFD, 0) | O_NONBLOCK) < 0) {
-		cerr << "Error while nonblocking socket" << endl;
-		close(listener);
-		return 0;
-	}
+	init_log();
 
-	sockaddr_in my_addr;
-	memset(&my_addr, 0, sizeof(my_addr));
-	my_addr.sin_family = AF_INET;
-	my_addr.sin_port = htons(8082);
-	my_addr.sin_addr.s_addr = INADDR_ANY;
+	socket_wrapper listener;
+	log("Init server's socket: " + int_to_string(listener.get_fd()));
 
-	if (bind(listener, (sockaddr *) &my_addr, sizeof(my_addr)) < 0) {
-		cout << "Bind error" << endl;
-		close(listener);
-		return 0;
-	}
+	listener.bind("0.0.0.0", 8082);
+	log("Bind for all IPs on port 8082");
 
-	if (listen(listener, 128) < 0) {
-		cout << "Set listener error" << endl;
-		close(listener);
-		return 0;
-	}
+	listener.listen();
+	log("Listen");
 
-	epoll_event ev, events[EPOLL_SIZE];
+	listener.make_nonblock();
+	log("Make server's socket nonblock");
 
-	ev.events = EPOLLIN | EPOLLET;
-	ev.data.fd = listener;
+	epoll_wrapper epoll;
+	log("Init epoll");
+	
+	epoll.add(listener, EPOLLET | EPOLLIN);
+	log("Add to epoll server's socket");
+	log("");
 
-	int epollfd;
-
-	epollfd = epoll_create(EPOLL_SIZE);
-	if (epollfd < 0) {
-		cout << "Creating epoll error" << endl;
-		close(listener);
-		return 0;
-	}
-
-	if (epoll_ctl(epollfd, EPOLL_CTL_ADD, listener, &ev) < 0) {
-		cout << "Adding socket to epoll error" << endl;
-		close(listener);
-		return 0;
-	}
-
-	sockaddr_in client_addr;
-	socklen_t client_addr_len;
-	char buffer[BUFFER_SIZE];
-
-	set < int > clients;
-	for (; ; ) {
-		int events_number = epoll_wait(epollfd, events, EPOLL_SIZE, -1);
-		if (events_number < 0) {
-			this_thread::sleep_for(chrono::milliseconds(100));
-			continue;
+	for (; ; ) {		
+		while (!clients.empty() && (unsigned long long) time(NULL) >= timer.get_next_expiration()) {
+			socket_wrapper tmp = timer.get_next().get_element();
+			log("Close socket " + int_to_string(tmp.get_fd()) + " because client has exceeded silence's time limit");
+			log("");
+			disconnect_client(tmp);
 		}
 
-		for (int i = 0; i < events_number; ++i) {
-			if (events[i].data.fd == listener) {
-				int client = accept(listener, (sockaddr *) &client_addr, &client_addr_len);
-				//setnonblocking
-				fcntl(client, F_SETFL, fcntl(client, F_GETFD, 0)| O_NONBLOCK);
-				ev.data.fd = client;
-				ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-				if (epoll_ctl(epollfd, EPOLL_CTL_ADD, client, &ev) < 0) {
-					cerr << "Error adding client. It was skipped" << endl;
-					close(client);
-					continue;	
-				}
+		vector <epoll_event> events;
+		if (clients.empty()) {
+			log("Epoll wait for the first client");
+			events = epoll.wait();
+		}
+		else {
+			unsigned long long ctime = time(NULL);
+			assert(ctime < timer.get_next_expiration());
+			log("Epoll wait any event for " + int_to_string(timer.get_next_expiration() - ctime) + " seconds");
+			events = epoll.wait((timer.get_next_expiration() - ctime) * 1000); //in millis
+		}
+		log("");
 
+		int sz = events.size();
+		for (int i = 0; i < sz; ++i) {
+			epoll_event cur = events[i];
+			if (cur.data.fd == listener.get_fd()) {				
+				socket_wrapper client = listener.accept();
+				log("New client " + int_to_string(client.get_fd()) + " was connected");
+
+				client.make_nonblock();
+				log("Client " + int_to_string(client.get_fd()) + " was made nonblock");
 				
+				client.set_buffer();
+				log("Init buffer for client " + int_to_string(client.get_fd()));
+				
+				epoll.add(client, EPOLLET | EPOLLIN);
+				log("Client " + int_to_string(client.get_fd()) + " was added to epoll with writing only");
 
 				clients.insert(client);
-				write(client, connnection_established.c_str(), connnection_established.size());
+				in_timer[client] = timer.add(client, CLIENT_TIMEOUT);
+				log("");
 			}
 			else {
-				int client = events[i].data.fd;
-				memset(buffer, 0, sizeof(buffer));
-				int was_read;
-				while ((was_read = read(client, buffer, BUFFER_SIZE)) > 0) {
-					for (auto fd : clients) {
-						write(fd, buffer, was_read);
-					}
-				}
+				socket_wrapper client(cur.data.fd);
+				auto it = clients.find(client);
+				client.invalidate();
+				client = *it;
+				update_client(client);
 
-				if (was_read == 0) {	
-					close(client);
-					cerr << "client " << client << " close connection" << endl;
-					clients.erase(client);
+				if (cur.events & EPOLLOUT) {
+					log("Client " + int_to_string(client.get_fd()) + " ready for writing");
+					client.write();
+					if (client.empty()) {
+						log("Client's buffer is empty. Added to epoll with writing only");
+						epoll.modify(client, EPOLLET | EPOLLIN);	
+					}
+					log("");
+				}
+				if (cur.events & EPOLLIN) {
+					log("Client " + int_to_string(client.get_fd()) + " ready for reading");	
+					string message;
+					if (client.read(message) == socket_wrapper::SOCKET_CLOSED) {
+						log("Client " + int_to_string(client.get_fd()) + " was closed by foreign server");
+						disconnect_client(client);						
+					}
+					else {
+						log("Message: " + message + " was read");
+						vector <socket_wrapper> bad;
+						for (socket_wrapper client : clients) {
+							if (client.write_to_buffer(message) == socket_wrapper::SOCKET_CLOSED) {
+								bad.push_back(client);
+							}
+							else {
+								log("Message has been written into buffer of client " + int_to_string(client.get_fd()));
+								epoll.modify(client, EPOLLET | EPOLLIN | EPOLLOUT);
+							}
+						}
+
+						for (socket_wrapper client : bad) {
+							log("Client " + int_to_string(client.get_fd()) + " was closed because its buffer was overflowed");
+							disconnect_client(client);
+						}
+					}
+					log("");
 				}
 			}
 		}
 	}
-	close(listener);
 
 	return 0;
 }

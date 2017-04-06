@@ -1,106 +1,139 @@
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <string.h>
-#include <netinet/in.h>
-#include <netdb.h>
 #include <iostream>
+#include "socket_wrapper.h"
+#include "epoll_wrapper.h"
+#include "logger.h"
+#include "timer_container.h"
+#include "utils.h"
 #include <thread>
-#include <fcntl.h>
-#include <sys/epoll.h>
 
 
 using namespace std;
 
+const char *log_file = "client_log";
 
-const int BUFFER_SIZE = 10;
-const int EPOLL_SIZE = 10;
+logger l;
 
-struct writer {
-	void operator() (int sock) {
-		for (; ; ) {
-			string s;
-			getline(cin, s);
+void init_log() {
+	l = logger(log_file);
+}
 
-			write(sock, s.c_str(), s.size());
+void log(string message) {
+	l.log(message);
+}
 
-			cout << "I send message: " << s << endl;
-		}
-	}
-};
+void server_disconnected() {
+	cerr << "Server was disconnected!" << endl;
+	exit(0);
+}
 
+string output_buffer;
 
-char buffer[BUFFER_SIZE];
+void flush_buffer() {
+	cout << output_buffer << endl;
+	output_buffer = "";
+}
 
+socket_wrapper server;
+
+bool connect() {
+	server = socket_wrapper();
+	if (!server.is_valid()) return false;
+	log("Init server's socket: " + int_to_string(server.get_fd()));
+	
+	server.set_buffer();
+	log("Init server's buffer");
+	
+	if (!server.connect("127.0.0.1", 8082)) return false;
+	log("Server was connected to 127.0.0.1::8082");
+	
+	if (!server.make_nonblock()) return false;
+	log("Server was made nonblock");
+	return true;
+}
+
+bool try_to_reconnect() {
+	return false;
+}
 
 
 int main() {
-	int sock = socket(AF_INET, SOCK_STREAM, 0);
-	fcntl(sock, F_SETFL, fcntl(sock, F_GETFD, 0)| O_NONBLOCK);
-	hostent *server;
-	if ((server = gethostbyname("127.0.0.1")) == NULL) {
-		cerr << "Couldn't resolve server host" << endl;
-		close(sock);
+	init_log();
+	//l.tie(cerr);
+
+	if (!connect()) {
+		log("Server unavailable");
 		return 0;
 	}
 
-	sockaddr_in addr;
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(8082);
-	memcpy(&addr.sin_addr.s_addr, server->h_addr_list[0], server->h_length);
+	epoll_wrapper epoll;
+	log("Init epoll");
 
-	connect(sock, (sockaddr *) &addr, sizeof(addr));
-	
+	epoll.add(server, EPOLLET | EPOLLIN);
+	log("Server's socket was added to epoll with writing only");
 
-	int epollfd;
-	if ((epollfd = epoll_create(EPOLL_SIZE)) < 0) {
-		cerr << "Error while epoll creating" << endl;
-		close(sock);
-		return 0;
-	}
-
-	epoll_event ev, events[EPOLL_SIZE];
-
-	ev.data.fd = sock;
-	ev.events = EPOLLIN | EPOLLET;
-
-	if (epoll_ctl(epollfd, EPOLL_CTL_ADD, sock, &ev) < 0) {
-		cerr << "Error while adding socket to epoll" << endl;
-		close(sock);
-		return 0;
-	}
-
-	thread th_writer(writer(), sock);
-
-	memset(buffer, 0, sizeof(buffer));
+	socket_wrapper input(stdin->_fileno);
+	epoll.add(input, EPOLLET | EPOLLIN);
+	log("Stdin was added to epoll");
+	log("");
 
 	for (; ; ) {
-		int events_number = epoll_wait(epollfd, events, EPOLL_SIZE, -1);
-		if (events_number < 0) {
-			this_thread::sleep_for(chrono::milliseconds(100));
-			continue;
-		}
-
-		for (int i = 0; i < events_number; ++i) {
-			int fd = events[i].data.fd;
-
-			string s;
-			int was_read;
-			while ((was_read = read(fd, buffer, BUFFER_SIZE - 1)) > 0) {
-				s += string(buffer);
-				memset(buffer, 0, sizeof(buffer));
+		vector <epoll_event> events = epoll.wait();
+		bool exit_flag = false;
+		for (epoll_event & cur : events) {
+			if (cur.data.fd == stdin->_fileno) {
+				log("Stdin ready for reading");
+				string message;
+				input.read(message);
+				//cerr << message << endl;
+				if (server.write_to_buffer(message) == socket_wrapper::SOCKET_CLOSED) {
+					log("Server's buffer was overflowed");
+					if (!try_to_reconnect()) {
+						log("Server is unavailable!");
+						exit_flag = true;
+						break;
+					}
+					else {
+						server.write_to_buffer(message);
+					}
+				}
+				else {
+					epoll.modify(server, EPOLLET | EPOLLIN | EPOLLOUT);
+				}
+			} 
+			else {
+				if (cur.events & EPOLLOUT) {
+					log("Server ready for writing");
+					server.write();	
+					if (server.empty()) {
+						epoll.modify(server, EPOLLET | EPOLLIN);
+					}
+					log("");
+				}
+				if (cur.events & EPOLLIN) {
+					log("Server ready for reading");
+					string message;
+					int ans = server.read(message);
+					if (ans == socket_wrapper::SOCKET_CLOSED) {	
+						log("Server disconnects");				
+						if (!try_to_reconnect()) {
+							log("Server is unavailable!");
+							exit_flag = true;
+							break;
+						}
+					} else {
+						for (char c : message) {
+							if (c == '\n') flush_buffer();
+							else output_buffer += c;
+						}
+					}
+				}
 			}
-			if (was_read == 0) {
-				cerr << "Server disconnected" << endl;
-				return 0;
-			}
-
-			cout << "I got message: " << s << endl;
 		}
-		
+		log("");
+		if (exit_flag) {
+			break;
+		}
 	}
-
-	close(sock);
+	input.invalidate();
 	return 0;
 }
